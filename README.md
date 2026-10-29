@@ -45,7 +45,7 @@ Direct comparison of LISNet to other state-of-the-art approaches trained and tes
 | H. Mask2Former | Pan. | 66.9 | -- | -- | -- | -- | -- | Hidden | [Darbyshire et al., 2023](https://arxiv.org/abs/2310.06582) |
 | linnchong | Inst. | 71.4 | -- | -- | -- | -- | -- | Hidden | [Linnchong, 2026](https://www.codabench.org/competitions/14022) |
 | LISNet | Inst. | 72.0 | **0.63** | **0.58** | **0.83** | **0.90** | **0.74** | Local | Ours |
-| LISNet | Inst. | -- | -- | -- | -- | -- | -- | Hidden | Ours |
+| LISNet | Inst. | 73.0 | -- | -- | -- | -- | -- | Hidden | Ours |
 | **LISNet + TTA** | **Inst.** | **74.4** | -- | -- | -- | -- | -- | **Hidden** | Ours |
 
 ![LISNet vs. SOTA](figures/sota_500dpi.png)
