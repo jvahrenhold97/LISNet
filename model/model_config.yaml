@@ -1,0 +1,20 @@
+data:
+  finetune_lr_factor: 0.2
+  m_interval: 1
+  cosine_factor: 0.75
+  max_queries: 64
+  center_thresh: 0.3
+  channels: 128
+  decoder_width: 256
+  decoder_layers: 6
+  decoder_heads: 8
+  num_deform_points: 32
+  w_center: 1.5
+  w_offset: 1.0
+  w_mask: 5.0
+  w_score: 2.0
+  w_semantic: 1.5
+  backbone: "convnext_small"
+  use_sliding_window: True
+  use_multiscale: False
+  use_tta: True
