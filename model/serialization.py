@@ -1,7 +1,9 @@
-import torch, os, glob
+import os
+import glob
+import torch
 from collections import defaultdict
-from model.lisnet import LISNet
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ConstantLR
+from model.lisnet import LISNet
 from utilities import logging
 
 
@@ -11,10 +13,12 @@ def build_optimizer_and_scheduler(
     base_lr: float = 5e-5,
     max_epochs: int = 150,
     factor: float = 1.0,
-    cosine_span_ratio: float = 0.75,
+    cosine_factor: float = 0.75,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    """Construct AdamW optimizer and the exact four-phase learning rate schedule from the paper."""
+    """Constructs AdamW optimizer and the paper-aligned four-phase learning rate schedule."""
     main_lr = base_lr * factor
+    absolute_minimum_lr = float(5e-7) if (base_lr == 5e-5 and factor == 1.0) else float(main_lr * 0.01)
+
     if state == "finetune":
         for param in model.backbone.parameters():
             param.requires_grad = False
@@ -26,6 +30,7 @@ def build_optimizer_and_scheduler(
     else:
         for param in model.parameters():
             param.requires_grad = True
+
     spatial_params = []
     mask_dec_base_params = []
     for name, param in model.mask_decoder.named_parameters():
@@ -35,11 +40,13 @@ def build_optimizer_and_scheduler(
             spatial_params.append(param)
         else:
             mask_dec_base_params.append(param)
+
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
     center_head_params = [p for p in model.center_head.parameters() if p.requires_grad]
     semantic_head_params = [p for p in model.semantic_head.parameters() if p.requires_grad]
     decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
     geometry_head_params = [p for p in model.geometry_head.parameters() if p.requires_grad]
+
     raw_groups = [
         {
             "params": decoder_params + semantic_head_params + mask_dec_base_params,
@@ -67,16 +74,21 @@ def build_optimizer_and_scheduler(
             "weight_decay": 1e-3,
         },
     ]
+
     param_groups = [g for g in raw_groups if len(g["params"]) > 0]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-5)
-    warmup_epochs = 5 if max_epochs >= 50 else max(1, int(round(max_epochs * (5 / 150))))
-    stabilize_epochs = 10 if max_epochs >= 50 else max(1, int(round(max_epochs * (10 / 150))))
+
+    warmup_epochs = 5 if max_epochs >= 50 else max(1, int(round(max_epochs * (5.0 / 150.0))))
+    stabilize_epochs = 10 if max_epochs >= 50 else max(1, int(round(max_epochs * (10.0 / 150.0))))
     stabilize_end = warmup_epochs + stabilize_epochs
-    cosine_epochs = int(round(max_epochs * cosine_span_ratio))
-    cosine_end = min(max_epochs, stabilize_end + cosine_epochs)
-    actual_cosine_duration = cosine_end - stabilize_end
+
+    c_factor = 0.75 if cosine_factor is None else float(cosine_factor)
+    cosine_duration = int(round(max_epochs * c_factor))
+    cosine_end = min(max_epochs, stabilize_end + cosine_duration)
+    actual_cosine_duration = max(1, cosine_end - stabilize_end)
     cooldown_epochs = max(0, max_epochs - cosine_end)
-    warmup_start_factor = 0.1 if state == "finetune" else 0.01
+
+    warmup_start_factor = 0.1 if state == "finetune" else max(1e-4, absolute_minimum_lr / main_lr)
     warmup_scheduler = LinearLR(
         optimizer,
         start_factor=warmup_start_factor,
@@ -88,65 +100,61 @@ def build_optimizer_and_scheduler(
         factor=1.0,
         total_iters=stabilize_epochs,
     )
-    eta_mins = [group["lr"] * 0.01 for group in optimizer.param_groups]
-    eta_min_arg = eta_mins[0] if len(eta_mins) == 1 else eta_mins
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
         T_max=actual_cosine_duration,
-        eta_min=eta_min_arg,
+        eta_min=float(absolute_minimum_lr),
     )
+
+    cooldown_factor = max(1e-4, float(absolute_minimum_lr / main_lr))
     cooling_scheduler = ConstantLR(
         optimizer,
-        factor=1.0,
+        factor=cooldown_factor,
         total_iters=max(1, cooldown_epochs),
     )
-    milestones = [
-        warmup_epochs,
-        stabilize_end,
-        cosine_end,
-    ]
+
+    if cooldown_epochs > 0:
+        schedulers = [warmup_scheduler, stabilizing_scheduler, cosine_scheduler, cooling_scheduler]
+        milestones = [warmup_epochs, stabilize_end, cosine_end]
+    else:
+        schedulers = [warmup_scheduler, stabilizing_scheduler, cosine_scheduler]
+        milestones = [warmup_epochs, stabilize_end]
+
     scheduler = SequentialLR(
         optimizer,
-        schedulers=[
-            warmup_scheduler,
-            stabilizing_scheduler,
-            cosine_scheduler,
-            cooling_scheduler,
-        ],
+        schedulers=schedulers,
         milestones=milestones,
     )
     return optimizer, scheduler
 
 
+def sanitize_scheduler_eta_min(scheduler: torch.optim.lr_scheduler.LRScheduler) -> None:
+    """Recursively coerces any list-based eta_min fields in loaded schedulers into scalar floats."""
+    sub_schedulers = getattr(scheduler, "_schedulers", [scheduler])
+    for s in sub_schedulers:
+        if hasattr(s, "eta_min"):
+            if isinstance(s.eta_min, (list, tuple)):
+                s.eta_min = float(s.eta_min[0])
+            else:
+                s.eta_min = float(s.eta_min)
+
+
 def try_resume(model, optimizer, scheduler, criterion, run_dir, device, state, config):
-    """Attempt to resume training from a checkpoint.
-    
-    Loads model, optimizer, scheduler, and criterion state from the latest checkpoint.
-    Returns default values if no checkpoint exists.
-    
-    Args:
-        model: LISNet model instance.
-        optimizer: PyTorch optimizer instance.
-        scheduler: Learning rate scheduler instance.
-        criterion: Loss function instance.
-        model_dir (str): Directory containing model checkpoints.
-        device: PyTorch device (cuda or cpu).
-        state (str): Either 'train' or 'finetune' mode.
-        config (dict): Configuration dictionary with 'dataset_name' and 'run_name'.
-    
-    Returns:
-        tuple: (start_epoch, best_val_loss, val_loss_patience, is_resumed, train_hist, val_hist, metrics_hist, lr_hist)
-    """
+    """Loads checkpoint state and sanitizes loaded scheduler structures against list-type minimums."""
     torch.serialization.add_safe_globals([defaultdict, list])
     ckpt_filename = "last.pt" if state == "train" else "last_finetune.pt"
     ckpt_path = os.path.join(run_dir, ckpt_filename)
     if not os.path.exists(ckpt_path):
         return (1, float("inf"), 0, False, None, None, None, None)
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     criterion.load_state_dict(ckpt["criterion"])
+
+    sanitize_scheduler_eta_min(scheduler)
+
     logging.prog_state(f"[RESUME] Resuming existing session: {os.path.basename(run_dir)}")
     logging.prog_state(f"[RESUME] Continuing from epoch {ckpt['epoch']}")
     return (
@@ -162,26 +170,8 @@ def try_resume(model, optimizer, scheduler, criterion, run_dir, device, state, c
 
 
 def save_ckpt(path, model, optimizer, scheduler, criterion, epoch, best_val_loss, score_patience, config=None, train_hist=None, val_hist=None, metrics_hist=None, lr_hist=None):
-    """Save training checkpoint with model, optimizer, and history.
-    
-    Saves complete training state including model weights, optimizer state, and loss histories
-    for resuming training or inference.
-    
-    Args:
-        path (str): File path where checkpoint will be saved.
-        model: LISNet model instance.
-        optimizer: Optimizer with state.
-        scheduler: Learning rate scheduler with state.
-        criterion: Loss function with state.
-        epoch (int): Current epoch number.
-        best_val_loss (float): Best validation loss seen so far.
-        score_patience (int): Early stopping patience counter.
-        config (dict or None): Training configuration dictionary.
-        train_hist (dict or None): Training loss history.
-        val_hist (dict or None): Validation loss history.
-        metrics_hist (dict or None): Computed metrics history.
-        lr_hist (list or None): Learning rate history per epoch.
-    """
+    """Serializes complete training checkpoint states to disk."""
+    sanitize_scheduler_eta_min(scheduler)
     torch.save(
         {
             "epoch": epoch,
@@ -202,25 +192,12 @@ def save_ckpt(path, model, optimizer, scheduler, criterion, epoch, best_val_loss
 
 
 def load_for_inference(ckpt_path, device):
-    """Load a trained LISNet model for inference.
-    
-    Reconstructs model architecture from saved configuration and loads checkpoint weights.
-    Sets model to evaluation mode.
-    
-    Args:
-        ckpt_path (str): Path to checkpoint file.
-        device: PyTorch device (cuda or cpu).
-    
-    Returns:
-        LISNet: Model in evaluation mode on the specified device.
-    """
+    """Instantiates model architecture from configuration and restores weights for evaluation."""
     logging.prog_state(f"[INFERENCE] Loading weights from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_cfg = ckpt.get("config", {})
-    if saved_cfg.get("tiny_backbone", False):
-        backbone_type = "convnext_tiny"
-    else:
-        backbone_type = saved_cfg.get("backbone", "convnext_small")
+    backbone_type = "convnext_tiny" if saved_cfg.get("tiny_backbone", False) else saved_cfg.get("backbone", "convnext_small")
+
     model = LISNet(
         num_classes=saved_cfg.get("num_classes", 2),
         max_queries=saved_cfg.get("max_queries", 64),
@@ -235,7 +212,7 @@ def load_for_inference(ckpt_path, device):
         enable_ms_dilation=saved_cfg.get("enable_ms_dilation", False),
         disable_coordatt=saved_cfg.get("disable_coordatt", False),
         disable_dropblock=saved_cfg.get("disable_dropblock", False),
-        enable_spatial_bias=saved_cfg.get("enable_spatial_bias", False)
+        enable_spatial_bias=saved_cfg.get("enable_spatial_bias", False),
     )
     model.load_state_dict(ckpt["model"])
     model.to(device)
@@ -245,31 +222,15 @@ def load_for_inference(ckpt_path, device):
 
 
 def load_for_finetuning(criterion, ckpt_path, device):
-    """Load a pre-trained LISNet model for finetuning.
-    
-    Reconstructs model from saved configuration, loads checkpoint weights, and optionally
-    loads criterion state. Sets model to training mode.
-    
-    Args:
-        criterion: Loss function instance to load state into.
-        ckpt_path (str): Path to pre-trained checkpoint file.
-        device: PyTorch device (cuda or cpu).
-    
-    Returns:
-        LISNet: Model in training mode on the specified device.
-    
-    Raises:
-        FileNotFoundError: If checkpoint file does not exist.
-    """
+    """Initializes LISNet architecture and restores pretrained weights for fine-tuning."""
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"[ERROR] Fine-tuning checkpoint not found at: {ckpt_path}")
+
     logging.prog_state(f"[FINETUNE] Loading pre-trained weights from {ckpt_path}...")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved_cfg = ckpt.get("config", {})
-    if saved_cfg.get("tiny_backbone", False):
-        backbone_type = "convnext_tiny"
-    else:
-        backbone_type = saved_cfg.get("backbone", "convnext_small")
+    backbone_type = "convnext_tiny" if saved_cfg.get("tiny_backbone", False) else saved_cfg.get("backbone", "convnext_small")
+
     model = LISNet(
         num_classes=saved_cfg.get("num_classes", 2),
         max_queries=saved_cfg.get("max_queries", 64),
@@ -284,12 +245,12 @@ def load_for_finetuning(criterion, ckpt_path, device):
         enable_ms_dilation=saved_cfg.get("enable_ms_dilation", False),
         disable_coordatt=saved_cfg.get("disable_coordatt", False),
         disable_dropblock=saved_cfg.get("disable_dropblock", False),
-        enable_spatial_bias=saved_cfg.get("enable_spatial_bias", False)
+        enable_spatial_bias=saved_cfg.get("enable_spatial_bias", False),
     )
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.train()
     if "criterion" in ckpt:
         criterion.load_state_dict(ckpt["criterion"])
-    logging.prog_state(f"[FINETUNE] Successfully warmed up model from pre-training checkpoint.")
+    logging.prog_state("[FINETUNE] Successfully warmed up model from pre-training checkpoint.")
     return model

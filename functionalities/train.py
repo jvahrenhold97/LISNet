@@ -169,7 +169,7 @@ def train_loop(state, model, criterion, train_loader, val_loader, test_loader, s
             logging.prog_state(f"[EARLY STOPPING] Score hasn't improved for {config.get('patience')} epochs.")
             break
     best_model = serialization.load_for_inference(os.path.join(curr_run_dir, "best.pt"), device) if state == "train" else serialization.load_for_inference(os.path.join(curr_run_dir, "best_finetune.pt"), device)
-    test.run(test_loader, device, curr_vis_dir, config, curr_run_dir, best_model)
+    test.run(test_loader, device, curr_vis_dir, config, best_model)
 
 
 def train_epoch(model, optimizer, criterion, train_loader, device, train_loss_history, scheduler, scaler):

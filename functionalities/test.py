@@ -34,7 +34,7 @@ def run_independent(device, config):
     run(test_loader, device, curr_vis_dir, config)
 
 
-def run(test_loader, device, curr_vis_dir, config):
+def run(test_loader, device, curr_vis_dir, config, model):
     """Evaluate model on test set and log results.
     
     Computes instance and center detection metrics, visualizes predictions,
@@ -50,8 +50,11 @@ def run(test_loader, device, curr_vis_dir, config):
     """
     all_center_metrics = []
     all_inst_metrics = []
-    model = serialization.load_for_inference(config.get("weights"), device)
-    model.eval()
+    if model is not None:
+        model.eval()
+    else:
+        model = serialization.load_for_inference(config.get("weights"), device)
+        model.eval()
     with torch.no_grad():
         pbar = tqdm(test_loader, desc=f"Testing...", ncols=200)
         for i, batch in enumerate(pbar):
